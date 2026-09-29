@@ -23,6 +23,24 @@ A nightly job can:
 Run it on a branch or in dry-run mode for the first few weeks and read the
 diffs.
 
+### Four ways this goes wrong (all seen in the system caderno came from)
+
+- **Merging in the database only.** If the job writes the merged fact to the
+  index and leaves the source files, the next reindex brings every source
+  back, the next night merges them again, and one fact multiplies (one reached
+  52 copies). Merge by editing and archiving *files*; let the index follow.
+- **Merging notes longer than the model's output.** A merge capped at a few
+  hundred tokens cannot keep a long note whole. Skip any group containing a
+  note too long for the output budget, rather than shrink it.
+- **Replacing a note people link to.** Keep the merged note under an existing
+  name, the one other notes link to. Never swap a named note for a new
+  generated one.
+- **Truncating on the way out.** Whatever writes a note must write all of it.
+  A cut description that is later read back as the note replaces the real text.
+
+Run the job with a dry-run flag that prints each group it would merge, and read
+that output before the first real run.
+
 ## Distill a taste profile
 
 Collect every note of `type: preference` and every rule, and ask an LLM to
