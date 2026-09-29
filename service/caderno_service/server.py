@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import contextvars
 import datetime as dt
-import hmac
 import json
 import logging
 import re
@@ -20,11 +20,14 @@ from starlette.responses import JSONResponse
 
 from caderno import notes
 
+from .agents import Agent, Registry
 from .config import Settings
 from .embed import Embedder, EmbedError
 from .store import Store
 
 log = logging.getLogger("caderno")
+# Set per request by BearerAuth; read by the tools to enforce scope and attribute writes.
+CURRENT_AGENT: contextvars.ContextVar[Agent | None] = contextvars.ContextVar("caderno_agent", default=None)
 WRITE_KEY = re.compile(r"^(memory|machines)/[a-z0-9][a-z0-9-]{0,79}$")
 
 INSTRUCTIONS = """\
@@ -37,9 +40,10 @@ The markdown files are the source of truth; these tools search and edit them.
 """
 
 
-def build(s: Settings) -> tuple[MCPServer, Store]:
+def build(s: Settings) -> tuple[MCPServer, Store, Registry]:
     embedder = Embedder(s)
     store = Store(s.database_url, s.notebook, embedder)
+    registry = Registry(s.database_url, s.token)
     mcp = MCPServer("caderno", instructions=INSTRUCTIONS, version="0.1.0")
 
     def run(fn, *args):
@@ -60,9 +64,22 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
                     "Store where the secret lives, not the secret itself."
                 )
 
-    def after_write(key: str) -> None:
+    def caller() -> Agent:
+        agent = CURRENT_AGENT.get()
+        if agent is None:  # BearerAuth guarantees this is set; fail closed if it is not
+            raise ToolError("no agent identity on this request")
+        return agent
+
+    def require_write() -> Agent:
+        agent = caller()
+        if not agent.can_write:
+            raise ToolError(f"agent '{agent.name}' is read-only; it can recall, history, context and status")
+        return agent
+
+    def after_write(key: str, agent: Agent, reason: str | None = None) -> None:
         notes.write_indexes(s.notebook)
         store.reconcile(only={key})
+        store.annotate(key, agent.name, reason)
 
     @mcp.tool()
     async def recall(query: str, limit: int = 5, type: str | None = None) -> dict:
@@ -89,6 +106,7 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
             name: file name, lowercase-with-dashes (default: made from the description)
             force: save even though similar notes exist (only when it is truly a different fact)
         """
+        agent = require_write()
         if type not in notes.NOTE_TYPES:
             raise ToolError(f"type must be one of {', '.join(notes.NOTE_TYPES)}")
         refuse_secrets(description, body)
@@ -113,7 +131,7 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
             with store.lock:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(notes.render({"description": description, "type": type}, body), encoding="utf-8")
-                after_write(key)
+                after_write(key, agent)
 
         await run(write)
         out = {"saved": True, "key": key, "file": f"{key}.md"}
@@ -139,6 +157,7 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
             body: the full new body (omit to keep); replaces the old body, so include what still holds
             type: new type (omit to keep)
         """
+        agent = require_write()
         path = check_key(key)
         key = key.removesuffix(".md").strip("/")
         if not path.exists():
@@ -155,8 +174,7 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
                 if type is not None:
                     meta["type"] = type
                 path.write_text(notes.render(meta, body if body is not None else old_body), encoding="utf-8")
-                after_write(key)
-                store.set_reason(key, reason)
+                after_write(key, agent, reason)
 
         await run(write)
         hist = await run(store.history, key)
@@ -170,6 +188,7 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
             key: the note's key, e.g. memory/old-setup
             reason: why it no longer applies
         """
+        agent = require_write()
         path = check_key(key)
         key = key.removesuffix(".md").strip("/")
         if not path.exists():
@@ -184,8 +203,7 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
                 meta["retired"] = f"{dt.date.today().isoformat()}: {reason}"
                 dest.write_text(notes.render(meta, body), encoding="utf-8")
                 path.unlink()
-                after_write(key)
-                store.set_reason(key, reason)
+                after_write(key, agent, reason)
                 return dest.relative_to(s.notebook).as_posix()
 
         archived = await run(move)
@@ -211,7 +229,9 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
     async def status() -> dict:
         """How healthy the index is: note counts, embedding model, last reconcile."""
         c = await run(store.counts)
+        me = caller()
         return {
+            "you": {"agent": me.name, "can_write": me.can_write},
             "notes": c,
             "embedding_model": embedder.label,
             "last_reconcile": store.last_reconcile.isoformat(timespec="seconds") if store.last_reconcile else None,
@@ -223,25 +243,37 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
         ok = store.last_reconcile is not None and store.last_error is None
         return JSONResponse({"ok": ok}, status_code=200 if ok else 503)
 
-    return mcp, store
+    return mcp, store, registry
 
 
 class BearerAuth:
-    """Require `Authorization: Bearer <CADERNO_TOKEN>` on everything except /health."""
+    """Every request except /health needs `Authorization: Bearer <token>` of a known agent."""
 
-    def __init__(self, app, token: str):
+    def __init__(self, app, registry: Registry):
         self.app = app
-        self.expected = f"Bearer {token}".encode()
+        self.registry = registry
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("path") != "/health":
-            got = dict(scope.get("headers") or []).get(b"authorization", b"")
-            if not hmac.compare_digest(got, self.expected):
-                body = json.dumps({"error": "missing or wrong bearer token"}).encode()
-                await send({"type": "http.response.start", "status": 401, "headers": [(b"content-type", b"application/json")]})
-                await send({"type": "http.response.body", "body": body})
-                return
-        await self.app(scope, receive, send)
+        if scope["type"] != "http" or scope.get("path") == "/health":
+            await self.app(scope, receive, send)
+            return
+        header = dict(scope.get("headers") or []).get(b"authorization", b"").decode("latin-1")
+        token = header[7:].strip() if header[:7].lower() == "bearer " else ""
+        try:
+            agent = await anyio.to_thread.run_sync(self.registry.resolve, token)
+        except Exception:
+            log.exception("token lookup failed")
+            agent = None
+        if agent is None:
+            body = json.dumps({"error": "missing, wrong or revoked bearer token"}).encode()
+            await send({"type": "http.response.start", "status": 401, "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        reset = CURRENT_AGENT.set(agent)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            CURRENT_AGENT.reset(reset)
 
 
 def reconcile_loop(store: Store, every: int) -> None:
@@ -261,10 +293,11 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     s = Settings.from_env()
-    mcp, store = build(s)
+    mcp, store, registry = build(s)
     for attempt in range(30):  # the database may still be starting
         try:
             store.migrate()
+            registry.migrate()
             break
         except Exception as e:
             log.info("waiting for database (%s)", e.__class__.__name__)
@@ -277,7 +310,12 @@ def main() -> None:
     except Exception as e:  # keep serving; /health reports 503 until the next loop succeeds
         log.error("first index failed, will retry every %ss: %s", s.reindex_seconds, e)
     threading.Thread(target=reconcile_loop, args=(store, s.reindex_seconds), daemon=True).start()
-    app = BearerAuth(mcp.streamable_http_app(stateless_http=True, json_response=True, host="0.0.0.0"), s.token)
+    if not s.token and not registry.list():
+        log.warning(
+            "no CADERNO_TOKEN and no agents yet, so nothing can connect. Add one: "
+            "docker compose exec api python -m caderno_service.agents add <name>"
+        )
+    app = BearerAuth(mcp.streamable_http_app(stateless_http=True, json_response=True, host="0.0.0.0"), registry)
     uvicorn.run(app, host="0.0.0.0", port=s.port, log_level="warning")
 
 

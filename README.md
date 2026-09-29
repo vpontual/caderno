@@ -97,7 +97,7 @@ at any time.
 
 ```bash
 cd ~/.local/share/caderno-kit/service
-cp .env.example .env          # set the notebook path, two secrets, your embedding model
+cp .env.example .env          # set the notebook path, a database password, your embedding model
 docker compose up -d
 curl -s localhost:8420/health # {"ok": true}
 ```
@@ -106,17 +106,36 @@ Any embedding model works: Ollama (`nomic-embed-text` or `qwen3-embedding:0.6b`
 run fine on a CPU), or any OpenAI-compatible endpoint such as vLLM, LM Studio,
 llama.cpp or OpenAI itself. No GPU is required.
 
-Connect your agents:
+Give each agent its own token. A token is read-and-write unless you say
+`--read-only`, and every write records which agent made it:
+
+```bash
+docker compose exec api python -m caderno_service.agents add codex-laptop
+docker compose exec api python -m caderno_service.agents add chat-ui --read-only
+docker compose exec api python -m caderno_service.agents list      # scope, last seen
+docker compose exec api python -m caderno_service.agents revoke chat-ui
+docker compose exec api python -m caderno_service.agents rotate codex-laptop
+```
+
+The token is printed once and stored only as a hash. Revoking takes effect on
+the next request. A read-only agent can `recall`, `history`, `context` and
+`status`; `remember`, `update` and `forget` refuse it.
+
+Connect each agent with its own token:
 
 ```bash
 # Codex
-export CADERNO_TOKEN=...      # in your shell profile
+export CADERNO_TOKEN=cad_...  # this agent's token, in your shell profile
 codex mcp add caderno --url http://127.0.0.1:8420/mcp --bearer-token-env-var CADERNO_TOKEN
 
 # Claude Code
 claude mcp add --scope user --transport http caderno http://127.0.0.1:8420/mcp \
   --header "Authorization: Bearer $CADERNO_TOKEN"
 ```
+
+`CADERNO_TOKEN` in the service's `.env` is optional: if set, it is a full-access
+token whose writes are recorded as `owner`. Leave it empty once every agent has
+its own.
 
 The tools:
 
@@ -126,9 +145,9 @@ The tools:
 | `remember` | save a new note; refuses if a similar note exists and points at it instead |
 | `update` | correct a note; the old version moves to history with the reason |
 | `forget` | retire a note to `_archive/`; it leaves search but stays in git |
-| `history` | every revision of a note and why it changed |
+| `history` | every revision of a note, why it changed, and which agent changed it |
 | `context` | the index and every-session files, for a machine with no copy of the notebook |
-| `status` | note counts, embedding model, last index run |
+| `status` | which agent you are, note counts, embedding model, last index run |
 
 `remember` and `update` also refuse text that looks like a secret.
 
@@ -170,7 +189,7 @@ caderno status                      what is set up on this machine
 python3 -m unittest discover -s tests          # CLI and notes, stdlib only
 # end to end, against a running service and a THROWAWAY notebook:
 pip install "mcp==2.2.0"
-python3 service/tests/e2e.py http://127.0.0.1:8420/mcp "$CADERNO_TOKEN" /tmp/test-notebook
+python3 service/tests/e2e.py http://127.0.0.1:8420/mcp "$WRITER_TOKEN" /tmp/test-notebook writer-name "$READER_TOKEN"
 ```
 
 ## License

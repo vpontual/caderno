@@ -107,26 +107,35 @@ On the always-on machine, which needs Docker and the notebook synced (step 4):
    cd $KIT/service
    cp .env.example .env
    # fill in CADERNO_NOTEBOOK, CADERNO_UID/GID (id -u / id -g), the EMBED_* lines,
-   # and two secrets from: openssl rand -hex 32
+   # and POSTGRES_PASSWORD from: openssl rand -hex 32. Leave CADERNO_TOKEN empty.
    chmod 600 .env
    docker compose up -d --build
    docker compose logs api | tail      # expect "indexed N added ..."
    curl -s localhost:8420/health       # {"ok": true}
    ```
-3. Connect the agents on this machine. The token goes in an environment
+3. Give every agent its own token, named for the agent and the machine it runs
+   on. Ask the owner which agents only need to read (a chat UI, a bot) and make
+   those `--read-only`:
+   ```bash
+   docker compose exec api python -m caderno_service.agents add codex-laptop
+   docker compose exec api python -m caderno_service.agents add chat-ui --read-only
+   ```
+   Each token is printed once. Hand it straight to its agent; don't write it
+   anywhere else.
+4. Connect the agents on this machine. The token goes in an environment
    variable, not in a config file that might get committed:
    ```bash
-   echo 'export CADERNO_TOKEN=<token from .env>' >> ~/.bashrc   # or ~/.zshrc
+   echo 'export CADERNO_TOKEN=<this agent's token>' >> ~/.bashrc   # or ~/.zshrc
    codex mcp add caderno --url http://127.0.0.1:8420/mcp --bearer-token-env-var CADERNO_TOKEN
    claude mcp add --scope user --transport http caderno http://127.0.0.1:8420/mcp \
      --header "Authorization: Bearer $CADERNO_TOKEN"
    ```
    Check each tool's `mcp --help` if these flags have changed.
-4. Other machines: the service listens on `127.0.0.1` only. To reach it from
+5. Other machines: the service listens on `127.0.0.1` only. To reach it from
    elsewhere, set `CADERNO_BIND=0.0.0.0`, but only if the machines share a
    private network (WireGuard, Tailscale, a trusted LAN). Explain to the owner
    that the token crosses the network unencrypted otherwise, and let them decide.
-5. Tune the duplicate check: `remember` refuses a note that is too similar to
+6. Tune the duplicate check: `remember` refuses a note that is too similar to
    an existing one. Save two notes about the same fact in different words and
    one about something unrelated, look at the scores `recall` returns, and set
    `DUPLICATE_THRESHOLD` between them. Then delete the test notes with `forget`.
@@ -142,6 +151,7 @@ Tell the owner, briefly:
 - where the notebook is and that they can edit it with any editor
 - what happens automatically (sync every 5 minutes; the service reindexes)
 - how to check health: `caderno status`, `caderno check`, `curl .../health`
+- how to see and cut off agents: `agents list` and `agents revoke <name>`
 - that the notebook is theirs to change: add folders, rename things, rewrite
   `INDEX.md`. Nothing depends on the names except the `memory/` and
   `machines/` folders the tools index.

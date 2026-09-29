@@ -29,7 +29,7 @@ services:
     user: "${CADERNO_UID:-1000}:${CADERNO_GID:-1000}"
     environment:
       DATABASE_URL: postgresql://caderno:${POSTGRES_PASSWORD}@db:5432/caderno
-      CADERNO_TOKEN: ${CADERNO_TOKEN:?set CADERNO_TOKEN in .env}
+      CADERNO_TOKEN: ${CADERNO_TOKEN:-}
       CADERNO_NOTEBOOK_PATH: /notebook
       EMBED_PROVIDER: ${EMBED_PROVIDER:-ollama}
       EMBED_URL: ${EMBED_URL:-http://host.docker.internal:11434}

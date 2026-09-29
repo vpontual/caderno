@@ -1,7 +1,10 @@
 """End-to-end test against a running service, through the real MCP protocol.
 
     pip install "mcp==2.2.0"
-    python service/tests/e2e.py http://127.0.0.1:8420/mcp "$CADERNO_TOKEN" /path/to/notebook
+    python service/tests/e2e.py http://127.0.0.1:8420/mcp "$WRITER_TOKEN" /path/to/notebook [AGENT_NAME [READER_TOKEN]]
+
+AGENT_NAME is the name the writer token was issued to ("owner" for CADERNO_TOKEN);
+with READER_TOKEN (from `agents add <name> --read-only`) the read-only scope is tested too.
 
 It writes, corrects and retires real notes, so point it at a throwaway
 notebook, never your own. Needs a real embedding model: the `fake` provider
@@ -21,6 +24,8 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 URL, TOKEN, NOTEBOOK = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+AGENT = sys.argv[4] if len(sys.argv) > 4 else "owner"
+READER = sys.argv[5] if len(sys.argv) > 5 else None
 RUN = str(int(time.time()))  # unique names, so reruns never collide with earlier history
 passed = 0
 
@@ -93,6 +98,7 @@ async def main() -> None:
             h = (await call(s, "history", key=key))["revisions"]
             ok([x["status"] for x in h] == ["superseded", "active"], "history keeps rev 1 as superseded")
             ok(h[-1]["reason"] == "measured: it also drops the run's partial results", "history records why it changed")
+            ok(h[-1]["by"] == AGENT and h[0]["by"] == AGENT, f"history records that agent '{AGENT}' made both revisions")
 
             r = await call(s, "recall", query="newsfeed redeploy pipeline")
             top = r["results"][0]
@@ -110,6 +116,8 @@ async def main() -> None:
                     break
                 time.sleep(1)
             ok(any(x["key"] == "machines/gpu-box" for x in r["results"]), "a hand-written file is indexed on its own")
+            gh = (await call(s, "history", key="machines/gpu-box"))["revisions"]
+            ok(gh[-1]["by"] == "file edit", "a hand edit is attributed to 'file edit', not to an agent")
 
             r = await call(s, "forget", key=key, reason="the pipeline now survives rebuilds")
             ok(r.get("forgotten") and (NOTEBOOK / r["archived_to"]).exists(), "forget moves the note to _archive")
@@ -130,6 +138,24 @@ async def main() -> None:
 
             r = await call(s, "status")
             ok(r["notes"]["active"] >= 1 and r["last_error"] is None, "status reports a healthy index")
+            ok(r["you"] == {"agent": AGENT, "can_write": True}, "status says which agent is calling")
+
+    if READER:
+        http = httpx2.AsyncClient(headers={"Authorization": f"Bearer {READER}"}, timeout=120)
+        async with streamable_http_client(URL, http_client=http) as streams:
+            async with ClientSession(streams[0], streams[1]) as s:
+                await s.initialize()
+                r = await call(s, "recall", query="which machine runs the language models?")
+                ok(bool(r.get("results")), "a read-only agent can recall")
+                r = await call(s, "remember", description="should not be saved", body="read-only agents cannot write")
+                ok("read-only" in r.get("error", ""), "a read-only agent cannot remember")
+                r = await call(s, "update", key="machines/gpu-box", reason="x", body="overwritten")
+                ok("read-only" in r.get("error", ""), "a read-only agent cannot update")
+                r = await call(s, "forget", key="machines/gpu-box", reason="x")
+                ok("read-only" in r.get("error", ""), "a read-only agent cannot forget")
+                ok((NOTEBOOK / "machines" / "gpu-box.md").exists(), "the note it tried to forget is still there")
+                r = await call(s, "status")
+                ok(r["you"]["can_write"] is False, "status reports the reader as read-only")
 
     print(f"\n{passed} checks passed")
 

@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS revisions (
     UNIQUE (key, rev)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_revision ON revisions (key) WHERE status = 'active';
+-- Which agent made a revision through the tools. NULL = the file was edited directly.
+ALTER TABLE revisions ADD COLUMN IF NOT EXISTS agent text;
 CREATE TABLE IF NOT EXISTS reconcile_log (
     id         bigserial PRIMARY KEY,
     at         timestamptz NOT NULL DEFAULT now(),
@@ -189,7 +191,7 @@ class Store:
     def history(self, key: str) -> list[dict]:
         with self.connect() as c:
             rows = c.execute(
-                "SELECT rev, status, description, body, created_at, ended_at, reason FROM revisions WHERE key=%s ORDER BY rev",
+                "SELECT rev, status, description, body, created_at, ended_at, reason, agent FROM revisions WHERE key=%s ORDER BY rev",
                 (key,),
             ).fetchall()
         return [
@@ -201,16 +203,18 @@ class Store:
                 "from": r[4].isoformat(timespec="seconds"),
                 "until": r[5].isoformat(timespec="seconds") if r[5] else None,
                 "reason": r[6],
+                "by": r[7] or "file edit",
             }
             for r in rows
         ]
 
-    def set_reason(self, key: str, reason: str) -> None:
-        """Attach the agent's stated reason to the newest revision of a key."""
+    def annotate(self, key: str, agent: str, reason: str | None = None) -> None:
+        """Record who made the newest revision of a key through the tools, and why."""
         with self.connect() as c:
             c.execute(
-                "UPDATE revisions SET reason=%s WHERE key=%s AND rev=(SELECT max(rev) FROM revisions WHERE key=%s)",
-                (reason, key, key),
+                "UPDATE revisions SET agent=%s, reason=coalesce(%s, reason)"
+                " WHERE key=%s AND rev=(SELECT max(rev) FROM revisions WHERE key=%s)",
+                (agent, reason, key, key),
             )
 
     def counts(self) -> dict:

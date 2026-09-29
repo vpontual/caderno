@@ -23,9 +23,11 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        # Optional: a full-access token for the owner. Agents should get their own
+        # tokens (python -m caderno_service.agents add <name>).
         token = os.environ.get("CADERNO_TOKEN", "")
-        if len(token) < 24:
-            raise SystemExit("CADERNO_TOKEN must be set to a long random string (openssl rand -hex 32)")
+        if token and len(token) < 24:
+            raise SystemExit("CADERNO_TOKEN is too short; use a long random string (openssl rand -hex 32)")
         return cls(
             notebook=Path(os.environ.get("CADERNO_NOTEBOOK_PATH", "/notebook")),
             database_url=os.environ["DATABASE_URL"],
