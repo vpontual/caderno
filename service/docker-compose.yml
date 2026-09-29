@@ -35,6 +35,7 @@ services:
       EMBED_URL: ${EMBED_URL:-http://host.docker.internal:11434}
       EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
       EMBED_API_KEY: ${EMBED_API_KEY:-}
+      EMBED_BATCH: ${EMBED_BATCH:-32}
       REINDEX_SECONDS: ${REINDEX_SECONDS:-300}
       DUPLICATE_THRESHOLD: ${DUPLICATE_THRESHOLD:-0.82}
     volumes:

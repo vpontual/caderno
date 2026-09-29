@@ -69,3 +69,41 @@ blocks a sync, so each one needs the shape of a real secret, not just the word
 - **The service host is also a sync host.** When an agent on another machine
   calls `remember`, the file is written on the service's machine and reaches
   the others through that machine's sync timer. Give it one.
+
+## Measured at scale (2026-09-29)
+
+Tested on a copy of the 764-note corpus caderno came from (4.1 MB of
+markdown), with `qwen3-embedding:0.6b` on a small remote GPU box.
+
+| Measure | Result |
+| --- | --- |
+| `caderno index` / `caderno check` | 0.2 s / 0.5 s |
+| First full embed of every note | 379 s (about 0.5 s a note; later runs embed only changed notes) |
+| Memory | 99 MB service, 35 MB Postgres |
+| `recall` latency | 370 ms median (mostly the embedding call) |
+| 25 questions written in different words from their notes | right note first 14/25, top 5 in 19/25, top 10 in 21/25 (MRR 0.65). Counting near-duplicate notes that answer the question equally well: 19/25 first |
+
+What the test changed:
+
+- **Big folders get split indexes.** A flat index of 764 lines is about 30k
+  tokens, which defeats "an index, not a dump". Past 150 notes, `INDEX.md`
+  lists groups and each group gets its own `INDEX-<group>.md`.
+- **Nested front matter is read.** Claude Code writes `metadata:` with `type`
+  and `category` indented under it; those notes had all been filed as one type.
+- **The password pattern ignores prose.** Half its hits were sentences such as
+  "a real password: authenticates with...", paths and config words. It now needs
+  a value with a digit, a capital, a symbol, or three joined words. On the same
+  corpus it went from 10 hits to the 5 real credentials.
+- **Embedding is batched**, so a first index is many small calls.
+
+What the test ruled out:
+
+- **Keyword search mixed with vectors (RRF) made recall worse**, 14 to 7 right
+  notes first, because questions share common words with many notes.
+- **Qwen3's recommended query instruction also made it slightly worse** (14 to 12).
+
+What it showed about duplicates: true duplicate pairs scored 0.76 to 0.87,
+while 44% of all notes had a neighbour at 0.75 or more. Similarity alone cannot
+tell "same fact" from "related fact", so `remember` blocks only above
+`DUPLICATE_THRESHOLD` (0.82) and, below it, returns the related notes for the
+agent to judge.

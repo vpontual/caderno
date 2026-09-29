@@ -16,6 +16,7 @@ class Settings:
     embed_url: str
     embed_model: str
     embed_api_key: str
+    embed_batch: int
     reindex_seconds: int
     duplicate_threshold: float
     port: int
@@ -33,6 +34,7 @@ class Settings:
             embed_url=os.environ.get("EMBED_URL", "http://host.docker.internal:11434").rstrip("/"),
             embed_model=os.environ.get("EMBED_MODEL", "nomic-embed-text"),
             embed_api_key=os.environ.get("EMBED_API_KEY", ""),
+            embed_batch=int(os.environ.get("EMBED_BATCH", "32")),
             reindex_seconds=int(os.environ.get("REINDEX_SECONDS", "300")),
             duplicate_threshold=float(os.environ.get("DUPLICATE_THRESHOLD", "0.82")),
             port=int(os.environ.get("PORT", "8420")),

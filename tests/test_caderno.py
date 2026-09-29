@@ -113,8 +113,42 @@ class NotesTest(unittest.TestCase):
             "api_key = <your key>",
             "Tokens rotate weekly; see the runbook.",
             "https://example.com/path@v2",
+            "There is a way back to a password: authenticates with the enrolment key",
+            "password = keyring (read from the OS keychain)",
+            "`permissionMode:'auto_allow'` bypasses the deny handler; token: auto_allow",
+            "the signing password: /home/me/keys/release.txt holds it",
         ]:
             self.assertEqual(notes.scan_text(line), [], line)
+
+    def test_nested_front_matter_round_trips(self):
+        text = "---\nname: x\ndescription: d\nmetadata:\n  type: project\n  category: apps/veetv\n---\n\nbody\n"
+        meta, body = notes.parse(text)
+        self.assertEqual(meta["metadata.type"], "project")
+        n = notes.Note(key="memory/x", path=Path("x.md"), meta=meta, body=body)
+        self.assertEqual((n.type, n.group), ("project", "apps"))
+        self.assertEqual(notes.parse(notes.render(meta, body))[0], meta)
+
+    def test_big_folders_split_into_group_indexes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "memory").mkdir()
+            for i in range(notes.SPLIT_AT + 5):
+                cat = "apps" if i % 2 else "fleet"
+                (root / "memory" / f"n{i:03d}.md").write_text(
+                    notes.render({"description": f"note {i}", "category": cat}, "x")
+                )
+            notes.write_indexes(root)
+            top = (root / "memory" / "INDEX.md").read_text()
+            self.assertIn("[apps (77)](INDEX-apps.md)", top)
+            self.assertNotIn("note 1 ", top, "the top index links to groups, not notes")
+            self.assertIn("- [n001](n001.md) — note 1", (root / "memory" / "INDEX-apps.md").read_text())
+            self.assertTrue(notes.indexes_current(root, "memory"))
+            # Shrink below the threshold: the group files are removed again.
+            for p in sorted((root / "memory").glob("n*.md"))[:10]:
+                p.unlink()
+            notes.write_indexes(root)
+            self.assertEqual(list((root / "memory").glob("INDEX-*.md")), [])
+            self.assertEqual(len(notes.searchable_notes(root)), notes.SPLIT_AT - 5)
 
     def test_allow_marker_and_denylist(self):
         self.assertEqual(notes.scan_text("password: fixture-value  <!-- caderno:allow -->"), [])

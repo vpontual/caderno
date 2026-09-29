@@ -20,6 +20,7 @@ class Embedder:
         self.url = s.embed_url
         self.model = s.embed_model
         self.key = s.embed_api_key
+        self.batch = max(1, s.embed_batch)
         self.http = httpx.Client(timeout=120)
 
     @property
@@ -28,6 +29,13 @@ class Embedder:
         return f"{self.provider}:{self.model}"
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed in batches, so a first index of hundreds of notes is many small calls."""
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self.batch):
+            out += self._embed(texts[i : i + self.batch])
+        return out
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
         try:

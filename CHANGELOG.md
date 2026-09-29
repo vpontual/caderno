@@ -14,3 +14,6 @@ First version.
   OpenAI-compatible embedding model, MCP over streamable HTTP with a bearer
   token. Tools: `recall`, `remember` (with duplicate check), `update` (with
   revision history), `forget`, `history`, `context`, `status`.
+- Scale-tested on 764 real notes (see docs/design.md): split indexes past 150
+  notes, nested front matter, fewer false secret alarms, batched embedding,
+  and `remember` now lists related notes it did not block on.

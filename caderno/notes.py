@@ -26,6 +26,10 @@ from pathlib import Path
 SEARCHABLE_DIRS = ("memory", "machines")
 ARCHIVE_DIR = "_archive"
 INDEX_NAME = "INDEX.md"
+# A folder with more notes than this gets a short INDEX.md that links to one
+# INDEX-<group>.md per group, so no single index grows past what an agent
+# should read in one go.
+SPLIT_AT = 150
 NOTE_TYPES = ("lesson", "preference", "project", "person", "machine", "reference")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
 
@@ -45,7 +49,18 @@ class Note:
 
     @property
     def type(self) -> str:
-        return self.meta.get("type", "").strip() or "lesson"
+        return (self.meta.get("type") or self.meta.get("metadata.type") or "").strip() or "lesson"
+
+    @property
+    def group(self) -> str:
+        """What the index groups this note under: its category, else its subfolder, else its type."""
+        cat = (self.meta.get("category") or self.meta.get("metadata.category") or "").strip()
+        if cat:
+            return slugify(cat.split("/")[0])
+        parts = self.key.split("/")
+        if len(parts) > 2:
+            return parts[1]
+        return self.type
 
     @property
     def name(self) -> str:
@@ -64,25 +79,67 @@ class Note:
         return f"{self.description}\n\n{self.body.strip()}"
 
 
+def _clean(v: str) -> str:
+    return v.strip().strip('"').strip("'")
+
+
 def parse(text: str) -> tuple[dict, str]:
-    """Split front matter from body. Only flat ``key: value`` lines are read."""
+    """Split front matter from body.
+
+    Reads flat ``key: value`` lines, plus one level of nesting, which is how
+    Claude Code writes its own memory files::
+
+        metadata:
+          type: project      -> meta["metadata.type"] = "project"
+    """
     if not text.startswith("---"):
         return {}, text
     lines = text.splitlines()
     meta: dict = {}
+    parent = None
     for i, line in enumerate(lines[1:], start=1):
         if line.strip() == "---":
             body = "\n".join(lines[i + 1 :])
             return meta, body.lstrip("\n")
-        if ":" in line and not line.startswith((" ", "\t")):
-            k, v = line.split(":", 1)
-            meta[k.strip()] = v.strip().strip('"').strip("'")
+        if ":" not in line or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        k, v = line.split(":", 1)
+        if line.startswith((" ", "\t")):
+            if parent:
+                meta[f"{parent}.{k.strip()}"] = _clean(v)
+            continue
+        k = k.strip()
+        if v.strip():
+            meta[k] = _clean(v)
+            parent = None
+        else:
+            parent = k
     # no closing marker: treat the whole thing as body
     return {}, text
 
 
 def render(meta: dict, body: str) -> str:
-    head = "\n".join(f"{k}: {v}" for k, v in meta.items() if v not in (None, ""))
+    """Front matter + body. Nested keys (``a.b``) are written back as a block."""
+    out, blocks = [], {}
+    for k, v in meta.items():
+        if v in (None, ""):
+            continue
+        if "." in k:
+            parent, child = k.split(".", 1)
+            if parent not in blocks:
+                blocks[parent] = []
+                out.append((parent, None))
+            blocks[parent].append((child, v))
+        else:
+            out.append((k, v))
+    lines = []
+    for k, v in out:
+        if v is None:
+            lines.append(f"{k}:")
+            lines += [f"  {ck}: {cv}" for ck, cv in blocks[k]]
+        else:
+            lines.append(f"{k}: {v}")
+    head = "\n".join(lines)
     return f"---\n{head}\n---\n\n{body.strip()}\n"
 
 
@@ -101,7 +158,7 @@ def searchable_notes(root: Path) -> list[Note]:
             continue
         for p in sorted(base.rglob("*.md")):
             rel = p.relative_to(base)
-            if p.name == INDEX_NAME or rel.parts[0] == ARCHIVE_DIR or p.name.startswith("."):
+            if p.name.startswith(("INDEX", ".")) or rel.parts[0] == ARCHIVE_DIR:
                 continue
             out.append(load(root, p))
     return out
@@ -112,8 +169,17 @@ def slugify(text: str) -> str:
     return s[:80].rstrip("-") or "note"
 
 
-def build_index(root: Path, folder: str = "memory") -> str:
-    """The generated one-line-per-note index for a folder.
+def _entry(n: Note, base: Path) -> str:
+    rel = n.path.relative_to(base).as_posix()
+    return f"- [{n.name}]({rel}) — {n.description or '(missing description)'}"
+
+
+def _group_order(groups: dict) -> list[str]:
+    return [t for t in NOTE_TYPES if t in groups] + sorted(t for t in groups if t not in NOTE_TYPES)
+
+
+def generated_indexes(root: Path, folder: str) -> dict[Path, str]:
+    """Every generated index file for a folder, with its exact contents.
 
     Output is deterministic (sorted, no timestamps) so two machines that
     regenerate it from the same files produce identical bytes and git never
@@ -123,34 +189,64 @@ def build_index(root: Path, folder: str = "memory") -> str:
     notes = [n for n in searchable_notes(root) if n.key.startswith(folder + "/")]
     groups: dict[str, list[Note]] = {}
     for n in notes:
-        groups.setdefault(n.type, []).append(n)
-    title = folder.capitalize()
-    lines = [f"# {title} index", "", GENERATED_MARK, ""]
-    if not notes:
-        lines.append("_No notes yet._")
-    order = [t for t in NOTE_TYPES if t in groups] + sorted(t for t in groups if t not in NOTE_TYPES)
-    for t in order:
-        lines += [f"## {t}", ""]
-        for n in sorted(groups[t], key=lambda n: n.key):
-            rel = n.path.relative_to(base).as_posix()
-            desc = n.description or "(missing description)"
-            lines.append(f"- [{n.name}]({rel}) — {desc}")
-        lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+        groups.setdefault(n.group, []).append(n)
+    head = [f"# {folder.capitalize()} index", "", GENERATED_MARK, ""]
+    files: dict[Path, str] = {}
+
+    if len(notes) <= SPLIT_AT:
+        lines = list(head)
+        if not notes:
+            lines.append("_No notes yet._")
+        for g in _group_order(groups):
+            lines += [f"## {g}", ""] + [_entry(n, base) for n in sorted(groups[g], key=lambda n: n.key)] + [""]
+        files[base / INDEX_NAME] = "\n".join(lines).rstrip() + "\n"
+        return files
+
+    lines = head + [
+        f"{len(notes)} notes in {len(groups)} groups. Open only the group that matches the task.",
+        "",
+    ]
+    for g in _group_order(groups):
+        name = f"INDEX-{slugify(g)}.md"
+        lines.append(f"- [{g} ({len(groups[g])})]({name})")
+        body = [f"# {folder.capitalize()}: {g}", "", GENERATED_MARK, ""]
+        body += [_entry(n, base) for n in sorted(groups[g], key=lambda n: n.key)]
+        files[base / name] = "\n".join(body).rstrip() + "\n"
+    files[base / INDEX_NAME] = "\n".join(lines).rstrip() + "\n"
+    return files
+
+
+def build_index(root: Path, folder: str = "memory") -> str:
+    """The folder's top-level INDEX.md."""
+    return generated_indexes(root, folder)[root / folder / INDEX_NAME]
+
+
+def _stale_group_files(root: Path, folder: str, keep: dict) -> list[Path]:
+    return [p for p in sorted((root / folder).glob("INDEX-*.md")) if p not in keep]
 
 
 def write_indexes(root: Path) -> list[Path]:
-    """Regenerate every folder index; return the ones that changed."""
+    """Regenerate every folder index; return the files that changed."""
     changed = []
     for folder in SEARCHABLE_DIRS:
         if not (root / folder).is_dir():
             continue
-        target = root / folder / INDEX_NAME
-        new = build_index(root, folder)
-        if not target.exists() or target.read_text(encoding="utf-8") != new:
-            target.write_text(new, encoding="utf-8")
-            changed.append(target)
+        want = generated_indexes(root, folder)
+        for path, text in want.items():
+            if not path.exists() or path.read_text(encoding="utf-8") != text:
+                path.write_text(text, encoding="utf-8")
+                changed.append(path)
+        for stale in _stale_group_files(root, folder, want):
+            stale.unlink()
+            changed.append(stale)
     return changed
+
+
+def indexes_current(root: Path, folder: str) -> bool:
+    want = generated_indexes(root, folder)
+    if _stale_group_files(root, folder, want):
+        return False
+    return all(p.exists() and p.read_text(encoding="utf-8") == t for p, t in want.items())
 
 
 # --- secrets ---------------------------------------------------------------
@@ -168,10 +264,24 @@ SECRET_PATTERNS = [
     ("bearer token", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{24,}")),
     (
         "password assignment",
-        re.compile(r"(?i)\b(?:password|passwd|pwd|secret|api[_-]?key|token)\s*[:=]\s*[\"']?(?!<|\$|\{)[^\s\"'`]{6,}"),
+        re.compile(r"(?i)\b(?:password|passwd|pwd|secret|api[_-]?key|token)\s*[:=]\s*[\"']?(?!<|\$|\{)([^\s\"'`]{6,})"),
     ),
     ("credentials in URL", re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]{3,}@")),
 ]
+
+
+def _looks_like_a_value(v: str) -> bool:
+    """For `password: X`: is X a credential, or just the next word of a sentence?
+
+    Measured on a real 765-note corpus: half the hits were prose ("a real
+    password: authenticates..."), paths, or config words ("auto_allow").
+    """
+    v = v.rstrip(".,;:)]}")
+    if len(v) < 6 or v.startswith(("/", "~", ".", "=", "`", "(")):
+        return False
+    # One lowercase word, or two joined (auto_allow), is prose or config.
+    # Three or more joined words is a passphrase (correct-horse-battery).
+    return not re.fullmatch(r"[a-z]+(?:[_-][a-z]+)?", v)
 
 
 def scan_text(text: str, denylist: list[str] | None = None) -> list[tuple[int, str]]:
@@ -181,7 +291,8 @@ def scan_text(text: str, denylist: list[str] | None = None) -> list[tuple[int, s
         if "caderno:allow" in line:  # explicit, reviewable escape hatch
             continue
         for label, rx in SECRET_PATTERNS:
-            if rx.search(line):
+            m = rx.search(line)
+            if m and (label != "password assignment" or _looks_like_a_value(m.group(1))):
                 hits.append((i, label))
                 break
         else:
@@ -217,8 +328,7 @@ def check(root: Path, denylist: list[str] | None = None) -> list[str]:
         if not SLUG_RE.match(n.name):
             problems.append(f"{rel}: file name should be lowercase-with-dashes")
     for folder in SEARCHABLE_DIRS:
-        idx = root / folder / INDEX_NAME
-        if (root / folder).is_dir() and (not idx.exists() or idx.read_text(encoding="utf-8") != build_index(root, folder)):
+        if (root / folder).is_dir() and not indexes_current(root, folder):
             problems.append(f"{folder}/{INDEX_NAME} is out of date (run `caderno index`)")
     for p in sorted(root.rglob("*.md")):
         if ".git" in p.parts:

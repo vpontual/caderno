@@ -97,8 +97,8 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
         path = check_key(key)
         if path.exists():
             return {"saved": False, "reason": f"{key} already exists", "next": f"call update with key '{key}'"}
+        similar = await run(store.recall, f"{description}\n\n{body}", 3, None)
         if not force:
-            similar = await run(store.recall, f"{description}\n\n{body}", 3, None)
             dupes = [r for r in similar if r["score"] >= s.duplicate_threshold]
             if dupes:
                 return {
@@ -116,7 +116,15 @@ def build(s: Settings) -> tuple[MCPServer, Store]:
                 after_write(key)
 
         await run(write)
-        return {"saved": True, "key": key, "file": f"{key}.md"}
+        out = {"saved": True, "key": key, "file": f"{key}.md"}
+        # Similarity cannot tell "same fact" from "related fact" reliably (measured:
+        # true duplicates scored 0.76-0.87 while 44% of notes had a neighbour >= 0.75),
+        # so below the block threshold the agent is shown close notes and decides.
+        related = [r for r in similar if r["score"] >= s.duplicate_threshold - 0.12]
+        if related:
+            out["related"] = [{k: r[k] for k in ("key", "description", "score")} for r in related]
+            out["next"] = "if one of these says the same thing, merge them: update it and forget this one"
+        return out
 
     @mcp.tool()
     async def update(
